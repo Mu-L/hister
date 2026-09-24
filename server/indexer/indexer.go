@@ -35,6 +35,7 @@ import (
 	"github.com/blevesearch/bleve/v2/analysis/token/lowercase"
 	"github.com/blevesearch/bleve/v2/analysis/tokenizer/single"
 	"github.com/blevesearch/bleve/v2/analysis/tokenizer/unicode"
+	"github.com/blevesearch/bleve/v2/index/scorch"
 	"github.com/blevesearch/bleve/v2/mapping"
 	"github.com/blevesearch/bleve/v2/registry"
 	"github.com/blevesearch/bleve/v2/search"
@@ -78,10 +79,12 @@ type Indexer struct {
 }
 
 const (
-	defaultIndexerName  = "index.db"
-	langIndexerName     = "index_%s.db"
-	updatedBackfillKey  = "hister.updated_backfill_complete"
-	updatedBackfillSize = 200
+	defaultIndexerName      = "index.db"
+	langIndexerName         = "index_%s.db"
+	updatedBackfillKey      = "hister.updated_backfill_complete"
+	updatedBackfillSize     = 200
+	bleveAsyncErrorCallback = "hister_background_error"
+	bleveErrorRetryDelay    = time.Second
 )
 
 type Query struct {
@@ -328,7 +331,8 @@ var (
 	ErrEmptyFilter                      = errors.New("query must not be empty")
 	ErrFileURLNotAllowed                = errors.New("file URL is not allowed")
 	bleveConfig          map[string]any = map[string]any{
-		"bolt_timeout": "2s",
+		"bolt_timeout":           "2s",
+		"asyncErrorCallbackName": bleveAsyncErrorCallback,
 		// https://github.com/blevesearch/bleve/blob/master/docs/persister.md
 		"scorchPersisterOptions": map[string]any{
 			"NumPersisterWorkers":           4,
@@ -340,6 +344,22 @@ var (
 		},
 	}
 )
+
+func init() {
+	// Bleve's callback registry must only be modified during initialization.
+	scorch.RegistryAsyncErrorCallbacks[bleveAsyncErrorCallback] = handleBleveAsyncError
+}
+
+func handleBleveAsyncError(err error, path string) {
+	log.Error().Err(err).Str("index", path).Msg("Search index background operation failed")
+	if errors.Is(err, scorch.ErrPersist) {
+		// Scorch calls this hook synchronously before retrying persistence or
+		// merge failures. Pace both loops without delaying successful writes.
+		// Each failing worker logs at most once per second. The wait is bounded
+		// so that the worker can still finish during shutdown.
+		time.Sleep(bleveErrorRetryDelay)
+	}
+}
 
 // New creates an independent indexer instance from cfg.
 func New(cfg *config.Config) (*Indexer, error) {
